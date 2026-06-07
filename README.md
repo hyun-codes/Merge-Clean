@@ -120,7 +120,7 @@ python -m http.server 8000
 
 ## 🎬 시연 영상
 
-📺 **[YouTube 데모]([https://www.youtube.com/watch?v=YOUR_VIDEO_ID](https://youtu.be/3RZxZrG7D9I))** 
+📺 **[YouTube 데모](https://youtu.be/3RZxZrG7D9I)** 
 
 내용 (1~3분):
 - 타이틀 화면 + 컨트롤
