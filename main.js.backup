@@ -1,0 +1,1770 @@
+/* ============================================================
+   Color Queue: Desktop Panic
+   - Queue 연산 딜레이 (Merge 0.5s lock)
+   - Subset 방어막 판정
+   - Glitch 청소 (collision-based)
+   - 5-stage loop infinity (X-1 normal / X-2 single / X-3 mixed / X-4 shop / X-5 boss)
+   - Data Bit 재화 + 상점 (인플레이션 공식)
+   - 보스 3종 + 페이즈 2 + 방화벽(Firewall) 기믹
+   ============================================================ */
+(() => {
+'use strict';
+
+// =====================================================
+//  Canvas / DOM
+// =====================================================
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = canvas.width;   // 960
+const H = canvas.height;  // 608
+
+const $ = (id) => document.getElementById(id);
+
+const ui = {
+  stage:     $('stage-indicator'),
+  hpFill:    $('hp-fill'),
+  hpText:    $('hp-text'),
+  bits:      $('db-count'),
+  shopBits:  $('shop-db-count'),
+  kill:      $('kill-counter'),
+  qMaxLabel: $('queue-max-label'),
+  slots:     Array.from(document.querySelectorAll('.ammo-slot')),
+  shopGrid:  $('shop-grid'),
+  shopContinue: $('shop-continue'),
+  banner:    { root: $('banner-overlay'), title: $('banner-title'), sub: $('banner-sub') },
+  overlays: {
+    loading:  $('loading-overlay'),
+    title:    $('title-overlay'),
+    banner:   $('banner-overlay'),
+    shop:     $('shop-overlay'),
+    gameover: $('gameover-overlay'),
+  },
+  goStat: $('go-stat'),
+};
+
+function showOverlay(name) {
+  Object.entries(ui.overlays).forEach(([k, el]) => {
+    el.classList.toggle('hidden', k !== name);
+  });
+}
+function hideAllOverlays() {
+  Object.values(ui.overlays).forEach(el => el.classList.add('hidden'));
+}
+function showBannerFor(t, title, sub) {
+  ui.banner.title.textContent = title;
+  ui.banner.sub.textContent = sub;
+  ui.banner.root.classList.remove('hidden');
+  setTimeout(() => ui.banner.root.classList.add('hidden'), t * 1000);
+}
+
+// =====================================================
+//  Assets (procedural — no external for now)
+// =====================================================
+const ASSETS = {};
+function loadImage(src, timeoutMs = 2000) {
+  return new Promise((res, rej) => {
+    const img = new Image();
+    const t = setTimeout(() => rej(new Error('Timeout: ' + src)), timeoutMs);
+    img.onload  = () => { clearTimeout(t); res(img); };
+    img.onerror = () => { clearTimeout(t); rej(new Error('Failed: ' + src)); };
+    img.src = src;
+  });
+}
+async function preloadAssets() {
+  // Optional sprite. Boot must NEVER block on assets — fallback is procedural.
+  // Kick off in background and resolve immediately so the game starts.
+  loadImage('assets/Pets/player.png.png')
+    .then(img => { ASSETS.player = img; })
+    .catch(err => console.warn('[assets] player sprite skipped:', err.message));
+  // tiny tick so DOM has a chance to paint the loading frame
+  await new Promise(r => setTimeout(r, 50));
+}
+
+// =====================================================
+//  Input
+// =====================================================
+const keys = new Set();
+const justPressed = new Set();
+window.addEventListener('keydown', (e) => {
+  if (['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code)) e.preventDefault();
+  if (!keys.has(e.code)) justPressed.add(e.code);
+  keys.add(e.code);
+});
+window.addEventListener('keyup', (e) => keys.delete(e.code));
+function consumeJustPressed(code) {
+  if (justPressed.has(code)) { justPressed.delete(code); return true; }
+  return false;
+}
+
+// =====================================================
+//  Colors / Atoms
+// =====================================================
+const COL = {
+  red:     { hex: '#ff4d4d', glow: '#ff8a8a' },
+  green:   { hex: '#3ddc6b', glow: '#9cf7b6' },
+  blue:    { hex: '#4d9dff', glow: '#a7caff' },
+  yellow:  { hex: '#ffd34d', glow: '#fff0a0' },
+  cyan:    { hex: '#4de2ff', glow: '#aef4ff' },
+  magenta: { hex: '#ff4dd2', glow: '#ffaef0' },
+};
+const PRIMARIES   = ['red', 'green', 'blue'];
+const SECONDARIES = ['yellow', 'cyan', 'magenta'];
+
+// atomic composition of every color
+const ATOMS = {
+  red:     ['R'],
+  green:   ['G'],
+  blue:    ['B'],
+  yellow:  ['R', 'G'],
+  cyan:    ['G', 'B'],
+  magenta: ['B', 'R'],
+};
+// "bullet contains shield" — shield atoms are a subset of bullet atoms
+function bulletContainsShield(bulletColor, shieldColor) {
+  const ba = ATOMS[bulletColor] || [];
+  const sa = ATOMS[shieldColor] || [];
+  return sa.every(a => ba.includes(a));
+}
+function mergeColors(a, b) {
+  const s = new Set([a, b]);
+  if (s.has('red') && s.has('green')) return 'yellow';
+  if (s.has('green') && s.has('blue')) return 'cyan';
+  if (s.has('blue') && s.has('red'))   return 'magenta';
+  return null;
+}
+
+// =====================================================
+//  Game State
+// =====================================================
+const G = {
+  state: 'loading',
+  stage: 1,               // 1, 2, ... infinite
+  player: null,
+  enemies: [],
+  bullets: [],
+  drops: [],
+  particles: [],
+  portal: null,
+  shake: { t: 0, mag: 0 },
+  deathTimer: 0,
+  dataBits: 0,
+  shop: {
+    counts: {
+      register_extension: 0,
+      bus_overclock: 0,
+      hardware_accel: 0,
+      buffer_opt: 0,
+    },
+    multiThreadBought: false,
+  },
+  // boss-only firewall (mooks orbiting the boss)
+  firewall: null, // { mooks: [], boss: ref }
+};
+
+function addShake(mag, t = 0.2) {
+  if (mag > G.shake.mag) G.shake.mag = mag;
+  if (t   > G.shake.t)   G.shake.t   = t;
+}
+
+// =====================================================
+//  Stage helpers
+// =====================================================
+function subStage(s) { return ((s - 1) % 5) + 1; }      // 1..5
+function loopNum(s)  { return Math.floor((s - 1) / 5) + 1; }
+function stageType(s) {
+  const k = subStage(s);
+  return ['normal','single-shield','mixed-shield','shop','boss'][k - 1];
+}
+function stageLabel(s) { return `STAGE ${loopNum(s)}-${subStage(s)}`; }
+function loopLabel(s)  { return `LOOP ${loopNum(s)}`; }
+function stageSubName(s) {
+  return {
+    'normal':        'Normal Wave',
+    'single-shield': 'Primary Shields',
+    'mixed-shield':  'Mixed Shields',
+    'shop':          'Safe Zone',
+    'boss':          'BOSS BATTLE',
+  }[stageType(s)];
+}
+
+// Data Bit drops scaling per loop
+function dropBits(loop) {
+  if (loop === 1) return 1 + Math.floor(Math.random() * 2);     // 1–2
+  if (loop === 2) return 3 + Math.floor(Math.random() * 3);     // 3–5
+  if (loop === 3) return 8 + Math.floor(Math.random() * 5);     // 8–12
+  const base = 8 + (loop - 3) * 6;
+  return base + Math.floor(Math.random() * Math.max(2, base / 2));
+}
+function bossBits(loop) {
+  if (loop === 1) return 20;
+  if (loop === 2) return 50;
+  if (loop === 3) return 120;
+  return Math.floor(120 * Math.pow(1.7, loop - 3));
+}
+
+// =====================================================
+//  Player
+// =====================================================
+function makePlayer() {
+  return {
+    x: W * 0.5, y: H * 0.5,
+    r: 16,
+    hp: 100, hpMax: 100,
+    dir: 0,
+    idleTime: 0,
+    fireCd: 0,
+    ammo: [],
+    invuln: 0,
+    // upgradeable stats
+    stats: {
+      queueMax: 4,
+      moveSpeed: 200,
+      fireCdBase: 0.35,
+      mergeDelay: 0.5,
+      hasMultiThread: false,
+    },
+    // processing lock (merge)
+    processing: 0,            // seconds remaining
+    processingType: '',       // 'merge'
+    // dash system (2-stack)
+    maxDashes: 2,
+    dashes: 2,
+    dashRechargeT: 0,         // seconds until next stack refills
+    dashRechargeDur: 2.0,
+    isDashing: false,
+    dashT: 0,                 // remaining dash time
+    dashDur: 0.15,
+    dashSpeed: 900,           // px/s during dash
+    dashVx: 0, dashVy: 0,
+    afterimages: [],          // {x,y,dir,t,maxT}
+  };
+}
+
+// magenta takes 2 queue slots, others 1
+function slotCost(color) { return color === 'magenta' ? 2 : 1; }
+function ammoSlotsUsed() {
+  let n = 0;
+  for (const c of G.player.ammo) n += slotCost(c);
+  return n;
+}
+function ammoCanFit(color) {
+  return ammoSlotsUsed() + slotCost(color) <= G.player.stats.queueMax;
+}
+
+function ammoPush(color) {
+  // slot-cost aware: magenta needs 2 free slots, others 1
+  if (!ammoCanFit(color)) return false;
+  G.player.ammo.push(color);
+  refreshAmmoUI();
+  return true;
+}
+function ammoShift() {
+  const c = G.player.ammo.shift();
+  refreshAmmoUI();
+  return c;
+}
+function refreshAmmoUI() {
+  const qmax = (G.player && G.player.stats) ? G.player.stats.queueMax : 4;
+  // Build the visual mapping: magenta occupies 2 adjacent slots
+  const visual = []; // per slot: color or null
+  for (const c of G.player.ammo) {
+    visual.push(c);
+    if (c === 'magenta') visual.push(c); // takes a second slot
+  }
+  for (let i = 0; i < 4; i++) {
+    const slot = ui.slots[i];
+    const c = visual[i];
+    const within = i < qmax;
+    slot.classList.toggle('locked', !within);
+    slot.classList.remove('mag-left', 'mag-right');
+    if (c) {
+      slot.classList.add('filled');
+      slot.style.background = COL[c].hex;
+      slot.style.color = COL[c].glow;
+      // mark magenta-occupied slots so CSS could merge their borders if desired
+      if (c === 'magenta') {
+        const prev = visual[i - 1];
+        const next = visual[i + 1];
+        if (prev !== 'magenta' && next === 'magenta') slot.classList.add('mag-left');
+        else if (prev === 'magenta' && next !== 'magenta') slot.classList.add('mag-right');
+      }
+    } else {
+      slot.classList.remove('filled');
+      slot.style.background = 'rgba(255,255,255,0.04)';
+      slot.style.color = 'transparent';
+    }
+  }
+  ui.qMaxLabel.textContent = `(${qmax})`;
+}
+
+function vecToDir(dx, dy) {
+  const ang = Math.atan2(dy, dx);
+  let idx = Math.round((ang / (Math.PI * 2)) * 8);
+  if (idx < 0) idx += 8;
+  return idx % 8;
+}
+
+// =====================================================
+//  Enemies
+// =====================================================
+function makeEnemy(type, x, y, opts = {}) {
+  const loop = loopNum(G.stage);
+  const hpMul = 1 + (loop - 1) * 0.4;
+  const spdMul = 1 + (loop - 1) * 0.1;
+  const base = {
+    type, x, y,
+    vx: 0, vy: 0,
+    enrageTime: 0,
+    enrageForever: false,
+    slowTime: 0,
+    shield: opts.shield || null,
+    isGlitch: false,
+    glitchTimer: 0,
+    glitchColor: null,
+    hitFlash: 0,
+    // boss-only
+    isBoss: !!opts.isBoss,
+    invincible: !!opts.invincible,   // firewall mooks
+    glitchSeed: Math.random() * 1000,
+  };
+  if (type === 'melee') {
+    return Object.assign(base, {
+      r: 14, hp: Math.ceil(2 * hpMul), hpMax: Math.ceil(2 * hpMul),
+      speed: 90 * spdMul,
+      state: 'wait', stateT: 0.6 + Math.random(),
+      dashSpeed: 360 * spdMul, color: '#c98a4b',
+    });
+  }
+  if (type === 'ranged') {
+    return Object.assign(base, {
+      r: 16, hp: Math.ceil(2 * hpMul), hpMax: Math.ceil(2 * hpMul),
+      speed: 70 * spdMul,
+      state: 'roam', stateT: 0.6, fireCd: 1.2,
+      color: '#a0a8b8',
+    });
+  }
+  if (type === 'tanker') {
+    return Object.assign(base, {
+      r: 22, hp: Math.ceil(4 * hpMul), hpMax: Math.ceil(4 * hpMul),
+      speed: 40 * spdMul,
+      state: 'roam', color: '#e3c79a',
+    });
+  }
+  if (type === 'firewall_mook') {
+    return Object.assign(base, {
+      r: 12, hp: 99, hpMax: 99,
+      speed: 0,
+      color: '#888', invincible: true,
+      orbitAng: opts.orbitAng || 0,
+      orbitR:   opts.orbitR || 80,
+      orbitBoss: opts.orbitBoss,
+    });
+  }
+  if (type === 'boss_melee') {
+    return Object.assign(base, {
+      r: 50,
+      hp: Math.ceil(10 * hpMul), hpMax: Math.ceil(10 * hpMul),
+      speed: 50 * spdMul,
+      state: 'wait', stateT: 1.0,
+      dashSpeed: 380 * spdMul, color: '#9a6cff',
+      isBoss: true, bossKind: 'melee',
+      phase2: false, stunT: 0, frenzyT: 0,
+    });
+  }
+  if (type === 'boss_ranged') {
+    return Object.assign(base, {
+      r: 50,
+      hp: Math.ceil(12 * hpMul), hpMax: Math.ceil(12 * hpMul),
+      speed: 40 * spdMul,
+      state: 'roam', fireCd: 0.6,
+      color: '#9a6cff',
+      isBoss: true, bossKind: 'ranged',
+      phase2: false, stunT: 0, frenzyT: 0,
+    });
+  }
+  if (type === 'boss_tanker') {
+    return Object.assign(base, {
+      r: 56,
+      hp: Math.ceil(16 * hpMul), hpMax: Math.ceil(16 * hpMul),
+      speed: 35 * spdMul,
+      state: 'roam', color: '#9a6cff',
+      isBoss: true, bossKind: 'tanker',
+      phase2: false, stunT: 0, frenzyT: 0,
+    });
+  }
+  return base;
+}
+
+function enrage(e, dur = 2.5) {
+  if (e.enrageTime < dur) e.enrageTime = dur;
+}
+
+// =====================================================
+//  Stage Setup
+// =====================================================
+function startStage(stage) {
+  G.stage = stage;
+  G.enemies.length = 0;
+  G.bullets.length = 0;
+  G.drops.length = 0;
+  G.particles.length = 0;
+  G.portal = null;
+  G.firewall = null;
+
+  const type = stageType(stage);
+  ui.stage.textContent = `${loopLabel(stage)} · ${stageLabel(stage)}`;
+
+  if (type === 'shop') {
+    openShop();
+    showBannerFor(1.4, stageLabel(stage), 'SAFE ZONE');
+    return;
+  }
+
+  showBannerFor(1.4, stageLabel(stage), stageSubName(stage));
+
+  if (type === 'boss') {
+    spawnBoss(stage);
+    return;
+  }
+
+  // normal / shielded stages
+  const loop = loopNum(stage);
+  const baseCount = 5 + Math.floor((loop - 1) * 2);
+  spawnWave(type, baseCount);
+
+  // seed primary drops
+  G.drops.push(makeDrop('red'));
+  G.drops.push(makeDrop('green'));
+  G.drops.push(makeDrop('blue'));
+}
+
+function spawnWave(type, baseCount) {
+  // ratio: 60% melee, 30% ranged, 10% tanker (scaled with loop)
+  const enemies = [];
+  for (let i = 0; i < baseCount; i++) {
+    const r = Math.random();
+    if (r < 0.55)      enemies.push('melee');
+    else if (r < 0.85) enemies.push('ranged');
+    else               enemies.push('tanker');
+  }
+
+  enemies.forEach(t => {
+    const [x, y] = randomSpawn();
+    let shield = null;
+    if (type === 'single-shield') {
+      shield = PRIMARIES[Math.floor(Math.random() * 3)];
+    } else if (type === 'mixed-shield') {
+      // 60% mixed, 40% primary so there's still some target variety
+      if (Math.random() < 0.6) shield = SECONDARIES[Math.floor(Math.random() * 3)];
+      else                      shield = PRIMARIES[Math.floor(Math.random() * 3)];
+    }
+    G.enemies.push(makeEnemy(t, x, y, { shield }));
+  });
+}
+
+function spawnBoss(stage) {
+  const loop = loopNum(stage);
+  const kindIdx = (loop - 1) % 3;
+  const kinds = ['boss_melee', 'boss_ranged', 'boss_tanker'];
+  const [x, y] = [W / 2, H / 2];
+  const boss = makeEnemy(kinds[kindIdx], x, y, {
+    shield: randomMixedShield(),
+    isBoss: true,
+  });
+  G.enemies.push(boss);
+
+  // give player some ammo to start with
+  ['red', 'green', 'blue'].forEach(c => {
+    G.drops.push(makeDrop(c));
+    G.drops.push(makeDrop(c));
+  });
+}
+
+function randomMixedShield() {
+  if (Math.random() < 0.5) return SECONDARIES[Math.floor(Math.random() * 3)];
+  return PRIMARIES[Math.floor(Math.random() * 3)];
+}
+
+function randomSpawn() {
+  const side = Math.floor(Math.random() * 4);
+  const pad = 60;
+  switch (side) {
+    case 0: return [pad + Math.random() * (W - 2 * pad), pad];
+    case 1: return [W - pad, pad + Math.random() * (H - 2 * pad)];
+    case 2: return [pad + Math.random() * (W - 2 * pad), H - pad];
+    default: return [pad, pad + Math.random() * (H - 2 * pad)];
+  }
+}
+
+// =====================================================
+//  Drops
+// =====================================================
+function makeDrop(color) {
+  return {
+    x: 80 + Math.random() * (W - 160),
+    y: 80 + Math.random() * (H - 160),
+    r: 10, color,
+    bob: Math.random() * Math.PI * 2,
+  };
+}
+function spawnDropAt(x, y, color) {
+  G.drops.push({ x, y, r: 10, color, bob: Math.random() * Math.PI * 2 });
+}
+
+// =====================================================
+//  Bullets
+// =====================================================
+function makeBullet(x, y, dx, dy, color, owner, opts = {}) {
+  const speed = opts.speed || (owner === 'player' ? 460 : 240);
+  const len = Math.hypot(dx, dy) || 1;
+  return {
+    x, y,
+    vx: (dx / len) * speed,
+    vy: (dy / len) * speed,
+    r: opts.r || 6,
+    color, owner,
+    dmg: opts.dmg ?? 1,
+    life: opts.life || 1.6,
+    pierce: color === 'magenta' && owner === 'player',  // bypass shields + pierce through
+    hitSet: [],                                          // enemies already hit (for pierce)
+  };
+}
+
+// =====================================================
+//  Particles
+// =====================================================
+function burst(x, y, color, n = 14, speed = 160) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const s = speed * (0.4 + Math.random() * 0.8);
+    G.particles.push({
+      x, y,
+      vx: Math.cos(a) * s,
+      vy: Math.sin(a) * s,
+      life: 0.4 + Math.random() * 0.3,
+      maxLife: 0.7,
+      color, size: 2 + Math.random() * 3,
+    });
+  }
+}
+
+// =====================================================
+//  Game Flow
+// =====================================================
+function newGame() {
+  G.dataBits = 0;
+  G.shop.counts = {
+    register_extension: 0, bus_overclock: 0,
+    hardware_accel: 0, buffer_opt: 0,
+  };
+  G.shop.multiThreadBought = false;
+  G.player = makePlayer();
+  G.enemies = []; G.bullets = []; G.drops = []; G.particles = [];
+  G.portal = null;
+  G.firewall = null;
+  G.shake.t = 0; G.shake.mag = 0;
+  G.deathTimer = 0;
+  refreshAmmoUI();
+  updateHpUI();
+  updateBitsUI();
+  startStage(1);
+  G.state = 'playing';
+  hideAllOverlays();
+}
+
+function gameOver() {
+  G.state = 'gameover';
+  G.deathTimer = 0.15;
+  addShake(14, 0.4);
+  burst(G.player.x, G.player.y, '#ff6c6c', 30, 220);
+  ui.goStat.textContent = `${stageLabel(G.stage)} · ${G.dataBits} Data Bit`;
+  showOverlay('gameover');
+}
+
+function clearedAndPortal() {
+  G.portal = { x: W / 2, y: H / 2, r: 28, active: true, t: 0 };
+}
+
+function nextStage() {
+  hideAllOverlays();
+  startStage(G.stage + 1);
+  if (G.state !== 'playing') G.state = 'playing';
+}
+
+// =====================================================
+//  Update — Top Level
+// =====================================================
+function update(dt) {
+  if (G.shake.t > 0) {
+    G.shake.t -= dt;
+    if (G.shake.t <= 0) G.shake.mag = 0;
+  }
+
+  if (G.state === 'title') {
+    if (consumeJustPressed('Space')) newGame();
+    return;
+  }
+  if (G.state === 'gameover') {
+    G.deathTimer -= dt;
+    if (G.deathTimer <= 0 && consumeJustPressed('Space')) newGame();
+    return;
+  }
+  if (G.state === 'shop') {
+    // shop is fully UI-driven; only allow Space to close
+    if (consumeJustPressed('Space')) {
+      closeShopAndAdvance();
+    }
+    return;
+  }
+  if (G.state !== 'playing') return;
+
+  updatePlayer(dt);
+  updateEnemies(dt);
+  updateBullets(dt);
+  updateDrops(dt);
+  updateParticles(dt);
+  updatePortal(dt);
+  updateFirewall(dt);
+
+  // stage-clear logic
+  if (stageType(G.stage) !== 'shop' && stageType(G.stage) !== 'boss') {
+    if (!G.portal && G.enemies.length === 0) clearedAndPortal();
+  } else if (stageType(G.stage) === 'boss') {
+    if (!G.portal && G.enemies.length === 0) clearedAndPortal();
+  }
+}
+
+// =====================================================
+//  Player Update
+// =====================================================
+function updatePlayer(dt) {
+  const p = G.player;
+  if (p.invuln > 0) p.invuln -= dt;
+
+  // --- Dash recharge (independent of processing/dashing) ---
+  if (p.dashes < p.maxDashes) {
+    p.dashRechargeT -= dt;
+    if (p.dashRechargeT <= 0) {
+      p.dashes = Math.min(p.maxDashes, p.dashes + 1);
+      p.dashRechargeT = p.dashes < p.maxDashes ? p.dashRechargeDur : 0;
+    }
+  }
+
+  // --- Afterimage decay (always tick) ---
+  for (let i = p.afterimages.length - 1; i >= 0; i--) {
+    const a = p.afterimages[i];
+    a.t -= dt;
+    if (a.t <= 0) p.afterimages.splice(i, 1);
+  }
+
+  // --- Active dash: i-frames, locked direction, ignores other input ---
+  if (p.isDashing) {
+    p.dashT -= dt;
+    p.x = Math.max(p.r, Math.min(W - p.r, p.x + p.dashVx * dt));
+    p.y = Math.max(p.r, Math.min(H - p.r, p.y + p.dashVy * dt));
+    // sample afterimages
+    p._aiSample = (p._aiSample || 0) + dt;
+    if (p._aiSample >= 0.025) {
+      p._aiSample = 0;
+      p.afterimages.push({ x: p.x, y: p.y, dir: p.dir, t: 0.22, maxT: 0.22 });
+    }
+    if (p.dashT <= 0) {
+      p.isDashing = false;
+      p.dashT = 0;
+    }
+    p.idleTime = 0;
+    p.fireCd = 0.2;
+    return;
+  }
+
+  // Processing lock (merge delay) — can't move/shoot/dash
+  if (p.processing > 0) {
+    p.processing -= dt;
+    if (p.processing <= 0) {
+      p.processing = 0;
+      p.processingType = '';
+    }
+    return;
+  }
+
+  let dx = 0, dy = 0;
+  if (keys.has('KeyW') || keys.has('ArrowUp'))    dy -= 1;
+  if (keys.has('KeyS') || keys.has('ArrowDown'))  dy += 1;
+  if (keys.has('KeyA') || keys.has('ArrowLeft'))  dx -= 1;
+  if (keys.has('KeyD') || keys.has('ArrowRight')) dx += 1;
+
+  // --- Dash trigger (Shift) ---
+  if (consumeJustPressed('ShiftLeft') || consumeJustPressed('ShiftRight')) {
+    if (p.dashes > 0) {
+      let ddx = dx, ddy = dy;
+      if (ddx === 0 && ddy === 0) {
+        // no direction → use last facing
+        const ang = (p.dir / 8) * Math.PI * 2;
+        ddx = Math.cos(ang); ddy = Math.sin(ang);
+      } else {
+        const dl = Math.hypot(ddx, ddy) || 1;
+        ddx /= dl; ddy /= dl;
+      }
+      p.isDashing = true;
+      p.dashT = p.dashDur;
+      p.dashVx = ddx * p.dashSpeed;
+      p.dashVy = ddy * p.dashSpeed;
+      p.dir = vecToDir(ddx, ddy);
+      p.dashes -= 1;
+      // start recharge timer if not already counting down
+      if (p.dashRechargeT <= 0) p.dashRechargeT = p.dashRechargeDur;
+      burst(p.x, p.y, '#aef4ff', 10, 220);
+      return;
+    }
+  }
+
+  const moving = (dx !== 0 || dy !== 0);
+  if (moving) {
+    const len = Math.hypot(dx, dy);
+    dx /= len; dy /= len;
+    p.x = Math.max(p.r, Math.min(W - p.r, p.x + dx * p.stats.moveSpeed * dt));
+    p.y = Math.max(p.r, Math.min(H - p.r, p.y + dy * p.stats.moveSpeed * dt));
+    p.dir = vecToDir(dx, dy);
+    p.idleTime = 0;
+    p.fireCd = 0.2;
+  } else {
+    p.idleTime += dt;
+    p.fireCd -= dt;
+  }
+
+  // R: pop front ammo
+  if (consumeJustPressed('KeyR')) {
+    if (p.ammo.length > 0) {
+      ammoShift();
+      burst(p.x, p.y, '#cccccc', 6, 80);
+    }
+  }
+  // Space: merge — triggers processing lock
+  if (consumeJustPressed('Space')) {
+    if (p.ammo.length >= 2) {
+      const merged = mergeColors(p.ammo[0], p.ammo[1]);
+      if (merged) {
+        // Magenta needs 2 slots. After merge: used - cost(a) - cost(b) + cost(merged).
+        // If merging two primaries into magenta, delta = -1 -1 + 2 = 0 → fits.
+        // But guard explicitly so a future queueMax tweak can't break this.
+        const futureUsed = ammoSlotsUsed() - slotCost(p.ammo[0]) - slotCost(p.ammo[1]) + slotCost(merged);
+        if (futureUsed > p.stats.queueMax) {
+          // not enough room for magenta (1 free slot only) → block
+          spawnFloater(p.x, p.y - 26, 'MAGENTA: NEED 2 SLOTS', '#ff4dd2');
+          burst(p.x, p.y - 20, '#ff4dd2', 6, 80);
+        } else {
+          p.ammo.splice(0, 2, merged);
+          refreshAmmoUI();
+          p.processing = p.stats.mergeDelay;
+          p.processingType = 'merge';
+          burst(p.x, p.y - 20, COL[merged].hex, 18, 180);
+        }
+      } else {
+        // invalid merge — small flash, no lock
+        burst(p.x, p.y - 20, '#ffffff', 6, 80);
+      }
+    }
+  }
+
+  // Auto-fire when standing still ≥ 0.2s and not processing
+  if (!moving && p.idleTime >= 0.2 && p.fireCd <= 0 && p.ammo.length > 0) {
+    const target = nearestEnemy(p.x, p.y);
+    if (target) {
+      const color = ammoShift();
+      const dxT = target.x - p.x, dyT = target.y - p.y;
+      G.bullets.push(makeBullet(p.x, p.y, dxT, dyT, color, 'player'));
+
+      // Multi-Threading passive: 15% extra projectile (no delay/cost)
+      if (p.stats.hasMultiThread && Math.random() < 0.15) {
+        G.bullets.push(makeBullet(p.x, p.y, dxT, dyT, color, 'player', { r: 5 }));
+      }
+
+      p.fireCd = p.stats.fireCdBase;
+      addShake(2, 0.05);
+    }
+  }
+
+  // Walk over glitch = free() — but skip firewall mooks (invincible)
+  for (let i = G.enemies.length - 1; i >= 0; i--) {
+    const e = G.enemies[i];
+    if (e.isGlitch) {
+      const d = Math.hypot(e.x - p.x, e.y - p.y);
+      if (d < p.r + e.r * 0.9) {
+        burst(e.x, e.y, COL[e.glitchColor]?.hex || '#fff', 22, 200);
+        addShake(3, 0.1);
+        const drop = dropBits(loopNum(G.stage));
+        G.dataBits += drop;
+        spawnFloater(e.x, e.y - 14, `+${drop} bit`, '#4de2ff');
+        updateBitsUI();
+        if (Math.random() < 0.55) {
+          const c = PRIMARIES[Math.floor(Math.random() * 3)];
+          spawnDropAt(e.x, e.y, c);
+        }
+        G.enemies.splice(i, 1);
+      }
+    }
+  }
+
+  // Walk into portal
+  if (G.portal && G.portal.active) {
+    const d = Math.hypot(G.portal.x - p.x, G.portal.y - p.y);
+    if (d < p.r + G.portal.r) nextStage();
+  }
+}
+
+// floating texts (e.g. +bits)
+const floaters = [];
+// expanding ring visual effects (yellow splash, cyan slow zone)
+const ringFX = [];
+function spawnRing(x, y, color, maxR = 80, life = 0.4) {
+  ringFX.push({ x, y, color, maxR, life, maxLife: life });
+}
+function spawnFloater(x, y, text, color) {
+  floaters.push({ x, y, text, color, life: 0.9, maxLife: 0.9 });
+}
+
+// =====================================================
+//  Enemies Update
+// =====================================================
+function updateEnemies(dt) {
+  const p = G.player;
+  for (let i = G.enemies.length - 1; i >= 0; i--) {
+    const e = G.enemies[i];
+
+    if (e.hitFlash > 0) e.hitFlash -= dt;
+    if (e.enrageTime > 0 && !e.enrageForever) e.enrageTime -= dt;
+    if (e.slowTime > 0) e.slowTime -= dt;
+
+    if (e.isGlitch) {
+      e.glitchTimer -= dt;
+      e.glitchSeed += dt * 60;
+      if (e.glitchTimer <= 0) {
+        // rebirth as enraged
+        e.isGlitch = false;
+        e.hp = Math.max(1, Math.ceil(e.hpMax * 0.5));
+        e.shield = null;
+        e.enrageForever = true;
+        e.enrageTime = 9999;
+        burst(e.x, e.y, '#ffae42', 18, 220);
+        addShake(4, 0.15);
+      }
+      continue;
+    }
+
+    if (e.invincible && e.type === 'firewall_mook') {
+      // orbit boss
+      const boss = e.orbitBoss;
+      if (boss && !boss.isGlitch && G.enemies.includes(boss)) {
+        e.orbitAng += dt * 2.4;
+        e.x = boss.x + Math.cos(e.orbitAng) * e.orbitR;
+        e.y = boss.y + Math.sin(e.orbitAng) * e.orbitR;
+      } else {
+        // boss gone → kill self
+        G.enemies.splice(i, 1);
+      }
+      continue;
+    }
+
+    const enraged = e.enrageTime > 0;
+    const speedMul = (e.slowTime > 0 ? 0.5 : 1) *
+                      (enraged ? (e.type === 'melee' || e.bossKind === 'melee' ? 1.5 : 1.2) : 1);
+
+    if (e.isBoss) {
+      updateBoss(e, p, dt, enraged, speedMul);
+    } else if (e.type === 'melee') {
+      updateMelee(e, p, dt, enraged, speedMul);
+    } else if (e.type === 'ranged') {
+      updateRanged(e, p, dt, enraged, speedMul);
+    } else if (e.type === 'tanker') {
+      updateTanker(e, p, dt, enraged, speedMul);
+    }
+
+    // contact damage (dash grants i-frames → no collision with enemies)
+    const dC = Math.hypot(e.x - p.x, e.y - p.y);
+    if (!e.isGlitch && !p.isDashing && dC < e.r + p.r) {
+      const dmg = e.isBoss ? 22 : (e.type === 'melee' ? 12 : 8);
+      damagePlayer(dmg);
+      const nx = (e.x - p.x) / (dC || 1), ny = (e.y - p.y) / (dC || 1);
+      e.x += nx * 14; e.y += ny * 14;
+    }
+
+    e.x = Math.max(e.r, Math.min(W - e.r, e.x));
+    e.y = Math.max(e.r, Math.min(H - e.r, e.y));
+  }
+}
+
+function updateMelee(e, p, dt, enraged, speedMul) {
+  e.stateT -= dt;
+  if (e.state === 'wait') {
+    const dx = p.x - e.x, dy = p.y - e.y;
+    const len = Math.hypot(dx, dy) || 1;
+    e.x += (dx / len) * e.speed * speedMul * dt * 0.45;
+    e.y += (dy / len) * e.speed * speedMul * dt * 0.45;
+    if (e.stateT <= 0) {
+      // enter telegraph (windup) — 0.5s standstill, red laser aim
+      e.state = 'windup';
+      e.stateT = enraged ? 0.35 : 0.5;
+      e.aimX = p.x; e.aimY = p.y;
+    }
+  } else if (e.state === 'windup') {
+    // track player so the laser sweeps toward where they're going
+    e.aimX = p.x; e.aimY = p.y;
+    if (e.stateT <= 0) {
+      // lock direction at fire moment; dash 2.5x base speed
+      const dx = e.aimX - e.x, dy = e.aimY - e.y;
+      const len = Math.hypot(dx, dy) || 1;
+      const charge = e.dashSpeed * 2.5 * (enraged ? 1.4 : 1);
+      e.vx = (dx / len) * charge;
+      e.vy = (dy / len) * charge;
+      e.state = 'dash';
+      e.stateT = 0.45;  // longer dash → traverses map
+      addShake(3, 0.1);
+    }
+  } else if (e.state === 'dash') {
+    e.x += e.vx * dt; e.y += e.vy * dt;
+    // near-zero decay so it actually crosses the map
+    e.vx *= 0.992; e.vy *= 0.992;
+    if (e.stateT <= 0) {
+      e.state = 'wait';
+      e.stateT = (enraged ? 0.45 : 0.9) + Math.random() * 0.4;
+    }
+  }
+}
+
+function updateRanged(e, p, dt, enraged, speedMul) {
+  e.fireCd -= dt;
+  const dx = p.x - e.x, dy = p.y - e.y;
+  const dist = Math.hypot(dx, dy) || 1;
+  const want = 220, dirX = dx / dist, dirY = dy / dist;
+  if (dist > want + 20) {
+    e.x += dirX * e.speed * speedMul * dt;
+    e.y += dirY * e.speed * speedMul * dt;
+  } else if (dist < want - 20) {
+    e.x -= dirX * e.speed * speedMul * dt;
+    e.y -= dirY * e.speed * speedMul * dt;
+  } else {
+    e.x += -dirY * e.speed * speedMul * dt * 0.4;
+    e.y +=  dirX * e.speed * speedMul * dt * 0.4;
+  }
+  if (e.fireCd <= 0) {
+    G.bullets.push(makeBullet(e.x, e.y, dirX, dirY, 'magenta', 'enemy',
+      { r: 5, dmg: 10, life: 2.4, speed: 220 }));
+    e.fireCd = enraged ? 0.18 : 1.2;
+  }
+}
+
+function updateTanker(e, p, dt, enraged, speedMul) {
+  const dx = p.x - e.x, dy = p.y - e.y;
+  const len = Math.hypot(dx, dy) || 1;
+  e.x += (dx / len) * e.speed * speedMul * dt;
+  e.y += (dy / len) * e.speed * speedMul * dt;
+}
+
+// ===================
+//  Boss AI
+// ===================
+function updateBoss(e, p, dt, enraged, speedMul) {
+  // Phase 2 trigger at <30% hp (once)
+  if (!e.phase2 && e.hp <= e.hpMax * 0.3) {
+    e.phase2 = true;
+    e.frenzyT = 3.0;
+    addShake(8, 0.4);
+    burst(e.x, e.y, '#ff4d6d', 40, 280);
+  }
+
+  // Stun phase: spawn firewall once, freeze movement
+  if (e.stunT > 0) {
+    e.stunT -= dt;
+    if (e.stunT <= 0) {
+      // remove firewall mooks
+      if (G.firewall) {
+        G.firewall.mooks.forEach(m => {
+          const idx = G.enemies.indexOf(m);
+          if (idx >= 0) G.enemies.splice(idx, 1);
+        });
+        G.firewall = null;
+      }
+      // shield refresh
+      e.shield = randomMixedShield();
+    }
+    return;
+  }
+
+  // Frenzy → after timer, trigger stun + firewall
+  if (e.frenzyT > 0) {
+    e.frenzyT -= dt;
+    // act extra aggressively while frenzy
+    e.enrageTime = Math.max(e.enrageTime, 0.4);
+
+    if (e.frenzyT <= 0) {
+      // enter stun
+      e.stunT = 4.0;
+      spawnFirewall(e);
+      addShake(10, 0.35);
+      return;
+    }
+  }
+
+  // Normal boss behavior
+  const bk = e.bossKind;
+  if (bk === 'melee') {
+    if (!e.state) e.state = 'wait';
+    if (!e.stateT) e.stateT = 1.0;
+    e.stateT -= dt;
+    if (e.state === 'wait') {
+      const dx = p.x - e.x, dy = p.y - e.y;
+      const len = Math.hypot(dx, dy) || 1;
+      e.x += (dx / len) * e.speed * speedMul * dt * 0.6;
+      e.y += (dy / len) * e.speed * speedMul * dt * 0.6;
+      if (e.stateT <= 0) { e.state = 'windup'; e.stateT = 0.5; }
+    } else if (e.state === 'windup') {
+      if (e.stateT <= 0) {
+        const dx = p.x - e.x, dy = p.y - e.y;
+        const len = Math.hypot(dx, dy) || 1;
+        e.vx = (dx / len) * e.dashSpeed;
+        e.vy = (dy / len) * e.dashSpeed;
+        e.state = 'dash'; e.stateT = 0.5;
+      }
+    } else if (e.state === 'dash') {
+      e.x += e.vx * dt; e.y += e.vy * dt;
+      e.vx *= 0.95; e.vy *= 0.95;
+      if (e.stateT <= 0) { e.state = 'wait'; e.stateT = e.phase2 ? 0.4 : 0.9; }
+    }
+  }
+  else if (bk === 'ranged') {
+    if (!e.fireCd) e.fireCd = 0.6;
+    e.fireCd -= dt;
+    const dx = p.x - e.x, dy = p.y - e.y;
+    const dist = Math.hypot(dx, dy) || 1;
+    const want = 250, dirX = dx / dist, dirY = dy / dist;
+    if (dist > want + 20) {
+      e.x += dirX * e.speed * speedMul * dt;
+      e.y += dirY * e.speed * speedMul * dt;
+    } else {
+      e.x += -dirY * e.speed * speedMul * dt * 0.5;
+      e.y +=  dirX * e.speed * speedMul * dt * 0.5;
+    }
+    if (e.fireCd <= 0) {
+      // multi-shot in phase 2
+      const shots = e.phase2 ? 3 : 1;
+      const spread = e.phase2 ? 0.3 : 0;
+      for (let i = 0; i < shots; i++) {
+        const a = Math.atan2(dirY, dirX) + (i - (shots - 1) / 2) * spread;
+        G.bullets.push(makeBullet(e.x, e.y, Math.cos(a), Math.sin(a),
+          'magenta', 'enemy', { r: 6, dmg: 12, speed: 260 }));
+      }
+      e.fireCd = e.phase2 ? 0.45 : 0.9;
+    }
+  }
+  else if (bk === 'tanker') {
+    const dx = p.x - e.x, dy = p.y - e.y;
+    const len = Math.hypot(dx, dy) || 1;
+    e.x += (dx / len) * e.speed * speedMul * dt;
+    e.y += (dy / len) * e.speed * speedMul * dt;
+  }
+}
+
+function spawnFirewall(boss) {
+  const n = 6;
+  const mooks = [];
+  for (let i = 0; i < n; i++) {
+    const m = makeEnemy('firewall_mook', boss.x, boss.y, {
+      orbitAng: (i / n) * Math.PI * 2,
+      orbitR: boss.r + 40,
+      orbitBoss: boss,
+    });
+    G.enemies.push(m);
+    mooks.push(m);
+  }
+  G.firewall = { boss, mooks };
+}
+
+function updateFirewall(dt) {
+  // no-op; mooks update themselves in updateEnemies
+}
+
+// =====================================================
+//  Bullets Update
+// =====================================================
+function updateBullets(dt) {
+  for (let i = G.bullets.length - 1; i >= 0; i--) {
+    const b = G.bullets[i];
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+    b.life -= dt;
+    if (b.life <= 0 || b.x < -20 || b.x > W + 20 || b.y < -20 || b.y > H + 20) {
+      G.bullets.splice(i, 1);
+      continue;
+    }
+    if (b.owner === 'player') {
+      let hit = false;
+      for (let j = 0; j < G.enemies.length; j++) {
+        const e = G.enemies[j];
+        if (e.isGlitch) continue;
+        if (b.hitSet && b.hitSet.includes(e)) continue; // pierce: skip already-hit
+        const d = Math.hypot(e.x - b.x, e.y - b.y);
+        if (d < e.r + b.r) {
+          applyHitToEnemy(e, b);
+          if (b.pierce) {
+            b.hitSet.push(e);
+            // continue traveling — don't break, allow hitting more
+          } else {
+            hit = true;
+            break;
+          }
+        }
+      }
+      // magenta keeps going; remove only when life expires
+      if (hit) G.bullets.splice(i, 1);
+    } else {
+      const p = G.player;
+      // dash i-frames: projectiles pass through harmlessly
+      if (p.isDashing) continue;
+      const d = Math.hypot(p.x - b.x, p.y - b.y);
+      if (d < p.r + b.r) {
+        damagePlayer(b.dmg);
+        G.bullets.splice(i, 1);
+      }
+    }
+  }
+}
+
+function applyHitToEnemy(e, b) {
+  e.hitFlash = 0.12;
+
+  // firewall mook: invincible, absorbs
+  if (e.invincible) {
+    burst(b.x, b.y, '#ffffff', 4, 80);
+    return;
+  }
+
+  // --- MAGENTA = PIERCE + BYPASS ALL SHIELDS + REFLECT IMMUNE ---
+  if (b.color === 'magenta' && b.owner === 'player') {
+    // skip tanker reflect (immune)
+    e.hp -= b.dmg;
+    if (e.hp <= 0) {
+      becomeGlitch(e, 'magenta');
+    }
+    // shield stays visually intact; HP just bleeds through
+    burst(e.x, e.y, COL.magenta.hex, 10, 180);
+    return;
+  }
+
+  // tanker passive reflect (non-boss) — non-magenta only
+  if (e.type === 'tanker') reflectShot(e, b);
+
+  if (e.shield) {
+    if (bulletContainsShield(b.color, e.shield)) {
+      // Shield breaks
+      const shieldCol = e.shield;
+      e.shield = null;
+      burst(e.x, e.y, COL[shieldCol].hex, 16, 200);
+
+      if (e.isBoss) {
+        // boss takes 1 hp + immediate shield refresh
+        e.hp -= 1;
+        if (e.hp <= 0) {
+          becomeGlitch(e, b.color);
+        } else {
+          e.shield = randomMixedShield();
+        }
+      } else {
+        // non-boss: shield break → straight to glitch
+        becomeGlitch(e, shieldCol);
+      }
+    } else {
+      // mismatch: 0 dmg + enrage
+      enrage(e, 2.5);
+      burst(e.x, e.y, '#ffffff', 8, 100);
+    }
+  } else {
+    // no shield: hp damage
+    e.hp -= b.dmg;
+    if (e.hp <= 0) becomeGlitch(e, b.color);
+  }
+
+  // --- YELLOW = AOE SPLASH (ignores shields, deals 1 chip damage to all in radius) ---
+  if (b.color === 'yellow') {
+    spawnRing(e.x, e.y, COL.yellow.hex, 80, 0.4);
+    for (const o of G.enemies) {
+      if (o === e || o.isGlitch || o.invincible) continue;
+      const dd = Math.hypot(o.x - e.x, o.y - e.y);
+      if (dd < 80) {
+        // ignore shield — splash chips HP directly
+        o.hp -= 1; o.hitFlash = 0.1;
+        if (o.hp <= 0) becomeGlitch(o, 'yellow');
+      }
+    }
+    addShake(3, 0.12);
+  }
+
+  // --- CYAN = AOE SLOW (applies to all in radius regardless of shield) ---
+  if (b.color === 'cyan') {
+    spawnRing(e.x, e.y, COL.cyan.hex, 80, 0.4);
+    for (const o of G.enemies) {
+      if (o.isGlitch || o.invincible) continue;
+      const dd = Math.hypot(o.x - e.x, o.y - e.y);
+      if (dd < 80) {
+        o.slowTime = Math.max(o.slowTime, 3);
+      }
+    }
+  }
+}
+
+function reflectShot(tanker, b) {
+  const enraged = tanker.enrageTime > 0;
+  const n = enraged ? 5 : 3;
+  const spread = enraged ? Math.PI * 0.9 : Math.PI * 0.35;
+  const speed = enraged ? 380 : 190;
+  const dx = G.player.x - tanker.x, dy = G.player.y - tanker.y;
+  const baseAng = Math.atan2(dy, dx);
+  for (let i = 0; i < n; i++) {
+    const t = (n === 1) ? 0 : (i / (n - 1) - 0.5);
+    const ang = baseAng + t * spread;
+    G.bullets.push(makeBullet(
+      tanker.x + Math.cos(ang) * tanker.r,
+      tanker.y + Math.sin(ang) * tanker.r,
+      Math.cos(ang), Math.sin(ang),
+      'magenta', 'enemy', { r: 5, dmg: 8, speed }
+    ));
+  }
+}
+
+function becomeGlitch(e, color) {
+  e.isGlitch = true;
+  e.glitchTimer = 3;
+  e.glitchColor = color || 'red';
+  e.shield = null;
+  e.hp = 0;
+  burst(e.x, e.y, COL[color]?.hex || '#fff', 18, 200);
+  addShake(3, 0.12);
+
+  // Event drop: random paint at enemy death location (60% chance)
+  if (!e.invincible && Math.random() < 0.6 && G.drops.length < 6) {
+    const c = PRIMARIES[Math.floor(Math.random() * 3)];
+    spawnDropAt(e.x, e.y, c);
+  }
+}
+
+function nearestEnemy(x, y) {
+  let best = null, bestD = Infinity;
+  for (const e of G.enemies) {
+    if (e.isGlitch) continue;
+    const d = (e.x - x) ** 2 + (e.y - y) ** 2;
+    if (d < bestD) { bestD = d; best = e; }
+  }
+  return best;
+}
+
+function damagePlayer(amount) {
+  const p = G.player;
+  if (p.invuln > 0) return;
+  p.hp -= amount;
+  p.invuln = 0.6;
+  addShake(8, 0.25);
+  burst(p.x, p.y, '#ff6c6c', 10, 160);
+  updateHpUI();
+
+  // Event drop: random paint somewhere on the map when player is hit
+  if (G.drops.length < 6 && p.hp > 0) {
+    const c = PRIMARIES[Math.floor(Math.random() * 3)];
+    spawnDropAt(
+      80 + Math.random() * (W - 160),
+      80 + Math.random() * (H - 160),
+      c
+    );
+  }
+
+  if (p.hp <= 0) gameOver();
+}
+
+function updateDrops(dt) {
+  for (let i = G.drops.length - 1; i >= 0; i--) {
+    const d = G.drops[i];
+    d.bob += dt * 3;
+    const dd = Math.hypot(d.x - G.player.x, d.y - G.player.y);
+    if (dd < d.r + G.player.r + 4) {
+      if (ammoPush(d.color)) {
+        burst(d.x, d.y, COL[d.color].hex, 10, 100);
+        G.drops.splice(i, 1);
+      }
+    }
+  }
+  // trickle drops (skip during boss to keep tension)
+  if (stageType(G.stage) !== 'boss' && stageType(G.stage) !== 'shop') {
+    if (Math.random() < dt * 0.25 && G.drops.length < 4) {
+      G.drops.push(makeDrop(PRIMARIES[Math.floor(Math.random() * 3)]));
+    }
+  } else if (stageType(G.stage) === 'boss') {
+    // boss gets occasional drops too
+    if (Math.random() < dt * 0.5 && G.drops.length < 5) {
+      const c = Math.random() < 0.7 ? PRIMARIES[Math.floor(Math.random() * 3)]
+                                     : SECONDARIES[Math.floor(Math.random() * 3)];
+      G.drops.push(makeDrop(c));
+    }
+  }
+}
+
+function updateParticles(dt) {
+  for (let i = G.particles.length - 1; i >= 0; i--) {
+    const p = G.particles[i];
+    p.life -= dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.vx *= 0.92; p.vy *= 0.92;
+    if (p.life <= 0) G.particles.splice(i, 1);
+  }
+  for (let i = floaters.length - 1; i >= 0; i--) {
+    const f = floaters[i];
+    f.life -= dt;
+    f.y -= dt * 30;
+    if (f.life <= 0) floaters.splice(i, 1);
+  }
+  for (let i = ringFX.length - 1; i >= 0; i--) {
+    const r = ringFX[i];
+    r.life -= dt;
+    if (r.life <= 0) ringFX.splice(i, 1);
+  }
+}
+
+function updatePortal(dt) {
+  if (!G.portal) return;
+  G.portal.t += dt;
+}
+
+// =====================================================
+//  Shop
+// =====================================================
+const SHOP_ITEMS = [
+  {
+    id: 'defrag', name: 'Defrag.exe', tag: 'CONSUMABLE',
+    desc: '최대 HP의 50% 즉시 회복.',
+    base: 15, inflate: false,
+    canBuy: () => G.player.hp < G.player.stats.hpMax,
+    maxed:  () => false,
+    apply: () => {
+      G.player.hp = Math.min(G.player.stats.hpMax,
+                              G.player.hp + Math.ceil(G.player.stats.hpMax * 0.5));
+      updateHpUI();
+    },
+  },
+  {
+    id: 'register_extension', name: 'Register Extension', tag: 'STAT',
+    desc: 'Queue 최대 길이 +1 (상한 6).',
+    base: 25, inflate: true,
+    canBuy: () => G.player.stats.queueMax < 6,
+    maxed:  () => G.player.stats.queueMax >= 6,
+    apply: () => {
+      G.player.stats.queueMax = Math.min(6, G.player.stats.queueMax + 1);
+      refreshAmmoUI();
+    },
+  },
+  {
+    id: 'bus_overclock', name: 'Bus Overclock', tag: 'STAT',
+    desc: '이동 속도 +12% (영구).',
+    base: 20, inflate: true,
+    canBuy: () => true,
+    maxed:  () => false,
+    apply: () => { G.player.stats.moveSpeed *= 1.12; },
+  },
+  {
+    id: 'hardware_accel', name: 'Hardware Acceleration', tag: 'STAT',
+    desc: '사격 간격 −0.05초 (하한 0.10초).',
+    base: 20, inflate: true,
+    canBuy: () => G.player.stats.fireCdBase > 0.105,
+    maxed:  () => G.player.stats.fireCdBase <= 0.105,
+    apply: () => {
+      G.player.stats.fireCdBase = Math.max(0.10, G.player.stats.fireCdBase - 0.05);
+    },
+  },
+  {
+    id: 'buffer_opt', name: 'Buffer Optimization', tag: 'STAT',
+    desc: 'Merge 연산 딜레이 −0.1초 (하한 0.2초).',
+    base: 30, inflate: true,
+    canBuy: () => G.player.stats.mergeDelay > 0.205,
+    maxed:  () => G.player.stats.mergeDelay <= 0.205,
+    apply: () => {
+      G.player.stats.mergeDelay = Math.max(0.20, G.player.stats.mergeDelay - 0.10);
+    },
+  },
+  {
+    id: 'multi_threading', name: 'Multi-Threading', tag: 'SPECIAL',
+    desc: '사격 시 15% 확률로 보조 투사체 발사. 게임당 1회.',
+    base: 80, inflate: false, special: true,
+    canBuy: () => !G.shop.multiThreadBought,
+    maxed:  () => G.shop.multiThreadBought,
+    apply: () => {
+      G.player.stats.hasMultiThread = true;
+      G.shop.multiThreadBought = true;
+    },
+  },
+];
+
+function itemPrice(item) {
+  if (!item.inflate) return item.base;
+  const c = G.shop.counts[item.id] || 0;
+  return Math.round(item.base * (1 + c * 0.5));
+}
+
+function tryBuy(item) {
+  if (item.maxed()) return false;
+  if (!item.canBuy()) return false;
+  const price = itemPrice(item);
+  if (G.dataBits < price) return false;
+  G.dataBits -= price;
+  item.apply();
+  if (item.inflate) {
+    G.shop.counts[item.id] = (G.shop.counts[item.id] || 0) + 1;
+  }
+  updateBitsUI();
+  renderShop();
+  return true;
+}
+
+function openShop() {
+  G.state = 'shop';
+  renderShop();
+  showOverlay('shop');
+}
+
+function closeShopAndAdvance() {
+  G.state = 'playing';
+  hideAllOverlays();
+  startStage(G.stage + 1);
+}
+
+function renderShop() {
+  ui.shopBits.textContent = G.dataBits;
+  ui.shopGrid.innerHTML = '';
+  SHOP_ITEMS.forEach((item, i) => {
+    const price = itemPrice(item);
+    const maxed = item.maxed();
+    const canAfford = G.dataBits >= price;
+    const ok = !maxed && item.canBuy() && canAfford;
+
+    const card = document.createElement('div');
+    card.className = 'shop-card' + (maxed ? ' maxed' : '') +
+                     (!ok && !maxed ? ' disabled' : '') +
+                     (item.special ? ' special' : '');
+    const tagClass = item.tag === 'CONSUMABLE' ? 'consumable'
+                  : item.tag === 'SPECIAL' ? 'special' : '';
+    const statText = item.inflate
+      ? `Owned: ${G.shop.counts[item.id] || 0}`
+      : (item.special ? (G.shop.multiThreadBought ? 'INSTALLED' : 'Available') : '');
+    card.innerHTML = `
+      <div class="card-title">
+        <span class="card-name">${item.name}</span>
+        <span class="card-tag ${tagClass}">${item.tag}</span>
+      </div>
+      <div class="card-desc">${item.desc}</div>
+      <div class="card-stat">${statText}</div>
+      <div class="card-foot">
+        <span class="card-price"><span class="price-icon">◈</span>${maxed ? 'MAX' : price}</span>
+        <span class="card-key">[${i + 1}]</span>
+      </div>
+    `;
+    card.addEventListener('click', () => tryBuy(item));
+    ui.shopGrid.appendChild(card);
+  });
+}
+
+// hotkeys 1..6 inside shop
+function shopHotkeys() {
+  if (G.state !== 'shop') return;
+  const codes = ['Digit1','Digit2','Digit3','Digit4','Digit5','Digit6'];
+  codes.forEach((c, i) => {
+    if (consumeJustPressed(c)) {
+      tryBuy(SHOP_ITEMS[i]);
+    }
+  });
+}
+
+ui.shopContinue.addEventListener('click', closeShopAndAdvance);
+
+// =====================================================
+//  HUD helpers
+// =====================================================
+function updateHpUI() {
+  const p = G.player;
+  if (!p) return;
+  const pct = Math.max(0, p.hp) / p.hpMax;
+  ui.hpFill.style.width = (pct * 100).toFixed(1) + '%';
+  ui.hpText.textContent = `${Math.max(0, p.hp)} / ${p.hpMax}`;
+}
+function updateBitsUI() {
+  ui.bits.textContent = G.dataBits;
+  if (ui.shopBits) ui.shopBits.textContent = G.dataBits;
+}
+function updateKillUI() {
+  const alive = G.enemies.filter(e => !e.isGlitch && !e.invincible).length;
+  const glitches = G.enemies.filter(e => e.isGlitch).length;
+  const wall = G.enemies.filter(e => e.invincible).length;
+  let text = `남은 적: ${alive}`;
+  if (glitches) text += `  · Glitch: ${glitches}`;
+  if (wall)     text += `  · 🔥: ${wall}`;
+  ui.kill.textContent = text;
+}
+
+// =====================================================
+//  Render
+// =====================================================
+function render() {
+  let ox = 0, oy = 0;
+  if (G.shake.mag > 0 && G.shake.t > 0) {
+    const m = G.shake.mag * Math.min(1, G.shake.t / 0.25);
+    ox = (Math.random() - 0.5) * m * 2;
+    oy = (Math.random() - 0.5) * m * 2;
+  }
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = '#14182a';
+  ctx.fillRect(0, 0, W, H);
+  drawGrid();
+
+  ctx.save();
+  ctx.translate(ox, oy);
+
+  drawDrops();
+  drawPortal();
+  drawGlitches();
+  drawEnemies();
+  drawBullets();
+  drawRingFX();
+  if (G.state === 'playing' || G.state === 'gameover') drawPlayer();
+  drawParticles();
+  drawFloaters();
+
+  ctx.restore();
+
+  if (G.state === 'playing') updateKillUI();
+}
+
+function drawGrid() {
+  ctx.strokeStyle = 'rgba(255,255,255,0.04)';
+  ctx.lineWidth = 1;
+  const step = 32;
+  for (let x = 0; x <= W; x += step) {
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
+  }
+  for (let y = 0; y <= H; y += step) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+  }
+}
+
+function drawDrops() {
+  for (const d of G.drops) {
+    const yo = Math.sin(d.bob) * 3;
+    ctx.save();
+    ctx.translate(d.x, d.y + yo);
+    ctx.fillStyle = COL[d.color].hex;
+    ctx.shadowColor = COL[d.color].glow;
+    ctx.shadowBlur = 12;
+    ctx.beginPath(); ctx.arc(0, 0, d.r, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+}
+
+function drawPortal() {
+  if (!G.portal) return;
+  const { x, y, r, t } = G.portal;
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(t * 1.2);
+  ctx.fillStyle = 'rgba(100,160,255,0.25)';
+  ctx.beginPath(); ctx.arc(0, 0, r + 8 + Math.sin(t * 6) * 2, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = '#7ec1ff'; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI * 2); ctx.stroke();
+  ctx.strokeStyle = '#cfe6ff'; ctx.lineWidth = 1.5;
+  for (let i = 0; i < 6; i++) {
+    const a = (i / 6) * Math.PI * 2;
+    ctx.beginPath();
+    ctx.moveTo(Math.cos(a) * r * 0.4, Math.sin(a) * r * 0.4);
+    ctx.lineTo(Math.cos(a) * r,        Math.sin(a) * r);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawGlitches() {
+  for (const e of G.enemies) {
+    if (!e.isGlitch) continue;
+    const c = COL[e.glitchColor] || COL.red;
+    const lifeFrac = Math.max(0, e.glitchTimer / 3);
+    const flash = (lifeFrac < 0.35 && Math.floor(performance.now() / 120) % 2 === 0) ? 1.4 : 1;
+    ctx.save();
+    ctx.translate(e.x, e.y);
+    // pixel noise blocks
+    const seed = e.glitchSeed;
+    for (let i = 0; i < 14; i++) {
+      const ang = (i / 14) * Math.PI * 2 + seed * 0.01;
+      const dist = (Math.sin(seed + i * 1.7) * 0.5 + 0.5) * e.r * 1.1 * flash;
+      const px = Math.cos(ang) * dist;
+      const py = Math.sin(ang) * dist;
+      const sz = 3 + ((seed * 13 + i) % 4);
+      ctx.fillStyle = i % 3 === 0 ? c.glow : c.hex;
+      ctx.globalAlpha = 0.6 + Math.random() * 0.4;
+      ctx.fillRect(px - sz / 2, py - sz / 2, sz, sz);
+    }
+    ctx.globalAlpha = 1;
+    // timer ring
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(0, 0, e.r + 8, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * lifeFrac);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+function drawEnemies() {
+  // === Melee windup telegraph (red laser) — drawn first so enemy sprite is on top ===
+  for (const e of G.enemies) {
+    if (e.isGlitch) continue;
+    if (e.type !== 'melee' || e.state !== 'windup') continue;
+    const ax = e.aimX, ay = e.aimY;
+    if (ax == null) continue;
+    const dx = ax - e.x, dy = ay - e.y;
+    const len = Math.hypot(dx, dy) || 1;
+    // extend the laser well past the player to show the dash trajectory
+    const tx = e.x + (dx / len) * (len + 360);
+    const ty = e.y + (dy / len) * (len + 360);
+    const total = (e.enrageTime > 0 ? 0.35 : 0.5);
+    const t = 1 - Math.max(0, Math.min(1, e.stateT / total)); // 0→1 progress
+    // pulsing alpha for tension; ramps higher near fire moment
+    const pulse = 0.55 + 0.35 * Math.sin(performance.now() / 60);
+    ctx.save();
+    ctx.globalAlpha = (0.35 + 0.5 * t) * pulse;
+    ctx.strokeStyle = '#ff3030';
+    ctx.shadowColor = '#ff6c6c';
+    ctx.shadowBlur = 12;
+    ctx.lineWidth = 2 + t * 3;
+    ctx.beginPath();
+    ctx.moveTo(e.x, e.y);
+    ctx.lineTo(tx, ty);
+    ctx.stroke();
+    // small target reticle on player position
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(ax, ay, 10 + 4 * Math.sin(performance.now() / 80), 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+    ctx.restore();
+  }
+
+  for (const e of G.enemies) {
+    if (e.isGlitch) continue;
+    ctx.save();
+    ctx.translate(e.x, e.y);
+
+    // shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.beginPath();
+    ctx.ellipse(0, e.r * 0.85, e.r * 0.9, e.r * 0.35, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    const enraged = e.enrageTime > 0;
+
+    // firewall mook: invincible cube
+    if (e.invincible && e.type === 'firewall_mook') {
+      ctx.fillStyle = '#ff5a4d';
+      ctx.shadowColor = '#ffae42';
+      ctx.shadowBlur = 14;
+      ctx.fillRect(-e.r, -e.r, e.r * 2, e.r * 2);
+      ctx.shadowBlur = 0;
+      ctx.strokeStyle = '#ffd166';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(-e.r, -e.r, e.r * 2, e.r * 2);
+      // small lock icon
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 12px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('🔒', 0, 4);
+      ctx.restore();
+      continue;
+    }
+
+    let body = e.color;
+    if (e.hitFlash > 0) body = '#ffffff';
+    else if (enraged || (e.isBoss && e.phase2)) body = mixHex(e.color, '#ff3030', 0.45);
+
+    ctx.fillStyle = body;
+    ctx.strokeStyle = '#1a1a1a';
+    ctx.lineWidth = 2;
+    if (e.isBoss) {
+      ctx.beginPath(); ctx.arc(0, 0, e.r, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+      // boss eyes
+      ctx.fillStyle = '#000';
+      ctx.fillRect(-e.r * 0.4, -e.r * 0.2, 8, 8);
+      ctx.fillRect( e.r * 0.3, -e.r * 0.2, 8, 8);
+    } else if (e.type === 'tanker') {
+      roundRect(-e.r, -e.r * 0.8, e.r * 2, e.r * 1.6, 8);
+      ctx.fill(); ctx.stroke();
+    } else if (e.type === 'ranged') {
+      ctx.beginPath(); ctx.arc(0, 0, e.r, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = '#222';
+      ctx.fillRect(-e.r * 0.5, -e.r * 0.2, 5, 5);
+      ctx.fillRect( e.r * 0.3, -e.r * 0.2, 5, 5);
+    } else {
+      ctx.beginPath(); ctx.arc(0, 0, e.r, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = body;
+      ctx.beginPath();
+      ctx.moveTo(-e.r * 0.5, -e.r * 0.6);
+      ctx.lineTo(-e.r * 0.1, -e.r * 1.3);
+      ctx.lineTo(-e.r * 0.05, -e.r * 0.5); ctx.closePath(); ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo( e.r * 0.5, -e.r * 0.6);
+      ctx.lineTo( e.r * 0.1, -e.r * 1.3);
+      ctx.lineTo( e.r * 0.05, -e.r * 0.5); ctx.closePath(); ctx.fill();
+    }
+
+    // shield
+    if (e.shield) {
+      const sc = COL[e.shield];
+      ctx.strokeStyle = sc.hex;
+      ctx.shadowColor = sc.glow;
+      ctx.shadowBlur = 14;
+      ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.arc(0, 0, e.r + 6, 0, Math.PI * 2); ctx.stroke();
+      ctx.shadowBlur = 0;
+    }
+
+    // hp bar
+    if (e.hp < e.hpMax) {
+      const w = e.r * 2;
+      ctx.fillStyle = 'rgba(0,0,0,0.6)';
+      ctx.fillRect(-w / 2, -e.r - 12, w, 4);
+      ctx.fillStyle = '#ff5a4d';
+      ctx.fillRect(-w / 2, -e.r - 12, w * (e.hp / e.hpMax), 4);
+    }
+
+    // enrage mark
+    if (enraged) {
+      ctx.fillStyle = '#ff3030';
+      ctx.font = 'bold 18px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('💢', 0, -e.r - 18);
+    }
+    // slow mark (cyan effect)
+    if (e.slowTime > 0 && !enraged) {
+      ctx.fillStyle = '#4de2ff';
+      ctx.font = 'bold 16px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('❄', 0, -e.r - 18);
+    }
+    // stun mark (boss)
+    if (e.isBoss && e.stunT > 0) {
+      ctx.fillStyle = '#ffd166';
+      ctx.font = 'bold 18px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('💤', 0, -e.r - 18);
+    }
+
+    ctx.restore();
+  }
+}
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y

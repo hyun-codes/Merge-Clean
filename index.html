@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Color Queue: Desktop Panic</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app">
+    <canvas id="game" width="960" height="608"></canvas>
+
+    <!-- Top HUD -->
+    <div id="hud-top">
+      <div id="stage-indicator">LOOP 1 · STAGE 1-1</div>
+      <div id="hp-bar"><div id="hp-fill"></div><span id="hp-text">100 / 100</span></div>
+      <div id="data-bits"><span class="db-icon">◈</span><span id="db-count">0</span><span class="db-label">Data Bit</span></div>
+      <div id="kill-counter">남은 적: 0</div>
+    </div>
+
+    <!-- Hold slot (bottom right, left of queue) -->
+    <div id="hold-panel">
+      <div class="ammo-label">HOLD <span class="hold-key">[E]</span></div>
+      <div class="ammo-slot hold-slot" id="hold-slot"></div>
+    </div>
+
+    <!-- Ammo Queue (bottom right) -->
+    <div id="ammo-panel">
+      <div class="ammo-label">QUEUE <span id="queue-max-label">(4)</span></div>
+      <div id="ammo-slots">
+        <div class="ammo-slot" data-idx="0"></div>
+        <div class="ammo-slot" data-idx="1"></div>
+        <div class="ammo-slot" data-idx="2"></div>
+        <div class="ammo-slot" data-idx="3"></div>
+      </div>
+      <div class="ammo-hint">[R] pop · [Space] merge · [E] hold</div>
+    </div>
+
+    <!-- Loading overlay -->
+    <div id="loading-overlay" class="overlay">
+      <div class="overlay-title">Color Queue</div>
+      <div class="overlay-sub">Desktop Panic</div>
+      <div class="overlay-hint">Loading…</div>
+    </div>
+
+    <!-- Title overlay -->
+    <div id="title-overlay" class="overlay hidden">
+      <div class="overlay-title">Color Queue</div>
+      <div class="overlay-sub">Desktop Panic</div>
+      <div class="overlay-body">
+        <p><b>WASD</b> 이동 · <b>좌클릭</b> 사격 (이동 중 사격 가능)</p>
+        <p><b>Shift</b> 대쉬 (3스택, i-frame) · <b>Space</b> merge · <b>R</b> pop · <b>E</b> hold</p>
+        <p>적이 깨지면 <b>Glitch</b>로 남는다. 직접 밟아 <code>free()</code>하라.</p>
+        <p><b>5스테이지마다</b> 보스 · <b>매 4스테이지</b>는 Safe Zone (Shop)</p>
+      </div>
+      <div class="overlay-hint">[Space] 시작</div>
+    </div>
+
+    <!-- Stage banner -->
+    <div id="banner-overlay" class="overlay banner hidden">
+      <div class="banner-title" id="banner-title">STAGE 1-1</div>
+      <div class="banner-sub" id="banner-sub">Normal Wave</div>
+    </div>
+
+    <!-- Shop overlay (Safe Zone) -->
+    <div id="shop-overlay" class="overlay shop hidden">
+      <div class="shop-header">
+        <div class="shop-title">SAFE ZONE — SYSTEM SHOP</div>
+        <div class="shop-balance">
+          <span class="db-icon">◈</span>
+          <span id="shop-db-count">0</span>
+          <span class="db-label">Data Bit</span>
+        </div>
+      </div>
+      <div id="shop-grid"><!-- populated by JS --></div>
+      <div class="shop-foot">
+        <button id="shop-continue">계속 진행 [Space]</button>
+      </div>
+    </div>
+
+    <!-- Game Over → Lobby (System Reboot Terminal) -->
+    <div id="gameover-overlay" class="overlay lobby hidden">
+      <div class="lobby-header">
+        <div class="overlay-title">SYSTEM CRASH</div>
+        <div class="overlay-sub" id="go-stat">Stage 1-1</div>
+        <div class="lobby-conv" id="lobby-conv">+0 Session → Core</div>
+      </div>
+
+      <div class="lobby-balance">
+        <span class="db-icon">◆</span>
+        <span id="lobby-core-count">0</span>
+        <span class="db-label">CORE BIT · 영구</span>
+      </div>
+
+      <div class="lobby-section-label">// PERMANENT_UPGRADES</div>
+      <div id="lobby-grid"><!-- populated by JS --></div>
+
+      <div class="lobby-foot">
+        <button id="reboot-btn">REBOOT &nbsp;[Space]</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="main.js"></script>
+</body>
+</html>
