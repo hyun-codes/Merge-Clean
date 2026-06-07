@@ -7,6 +7,7 @@
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
+  <div id="viewport">
   <div id="app">
     <canvas id="game" width="960" height="608"></canvas>
 
@@ -101,6 +102,18 @@
     </div>
   </div>
 
+  </div>
+  <script>
+    // Scale #app to fit viewport while maintaining 960x608 aspect ratio
+    (function () {
+      function resize() {
+        var s = Math.min(window.innerWidth / 960, window.innerHeight / 608);
+        document.documentElement.style.setProperty('--scale', s);
+      }
+      window.addEventListener('resize', resize);
+      resize();
+    })();
+  </script>
   <script src="main.js"></script>
 </body>
 </html>
